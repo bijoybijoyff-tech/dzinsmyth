@@ -8,11 +8,9 @@ from telegram.ext import (
 )
 from difflib import get_close_matches
 
-# ===================== কনফিগারেশন =====================
-BOT_TOKEN = 8516032711:AAF2M_QHaRUrCjrI8Rbks5kTthdn4M4ERh4       # @BotFather থেকে পান
-EXCEL_FILE = "data.xlsx"                 # আপনার এক্সেল ফাইলের নাম
-ADMIN_IDS = 6570213822                  # আপনার Telegram User ID (int)
-# ======================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+EXCEL_FILE = "data.xlsx"
+ADMIN_IDS = [int(os.environ.get("ADMIN_ID", "0"))]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -22,77 +20,66 @@ logger = logging.getLogger(__name__)
 
 
 def load_data() -> pd.DataFrame:
-    """এক্সেল ফাইল লোড করে DataFrame রিটার্ন করে"""
     try:
         df = pd.read_excel(EXCEL_FILE, dtype=str)
         df.columns = [str(c).strip() for c in df.columns]
-        df = df.fillna("—")
+        df = df.fillna("-")
         return df
     except FileNotFoundError:
-        logger.error(f"এক্সেল ফাইল পাওয়া যায়নি: {EXCEL_FILE}")
+        logger.error(f"Excel file not found: {EXCEL_FILE}")
         return pd.DataFrame()
     except Exception as e:
-        logger.error(f"এক্সেল লোড এরর: {e}")
+        logger.error(f"Excel load error: {e}")
         return pd.DataFrame()
 
 
 def find_item(df: pd.DataFrame, query: str) -> list[dict]:
-    """
-    আইটেম নেইম কলামে query খোঁজে।
-    প্রথম কলাম = Item Name হিসেবে ধরা হয়।
-    """
     if df.empty:
         return []
 
     name_col = df.columns[0]
     all_names = df[name_col].tolist()
 
-    # exact match (case-insensitive)
     exact = df[df[name_col].str.lower() == query.lower()]
     if not exact.empty:
         return exact.to_dict("records")
 
-    # partial / close match
     close = get_close_matches(query.lower(), [n.lower() for n in all_names], n=5, cutoff=0.4)
     if close:
         mask = df[name_col].str.lower().isin(close)
         return df[mask].to_dict("records")
 
-    # substring match
     mask = df[name_col].str.lower().str.contains(query.lower(), na=False)
     return df[mask].to_dict("records")
 
 
 def format_item_response(items: list[dict]) -> str:
-    """আইটেম তথ্য সুন্দরভাবে ফরম্যাট করে"""
     if not items:
-        return "❌ কোনো আইটেম পাওয়া যায়নি।"
+        return "No item found."
 
     lines = []
     for item in items:
         cols = list(item.keys())
-        lines.append("─" * 28)
+        lines.append("-" * 28)
         for i, col in enumerate(cols):
             emoji = "📦" if i == 0 else ("💰" if i == 2 else ("🔢" if i == 1 else "📌"))
             lines.append(f"{emoji} *{col}:* {item[col]}")
-    lines.append("─" * 28)
+    lines.append("-" * 28)
     return "\n".join(lines)
 
 
-# ==================== হ্যান্ডলারস ====================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = load_data()
-    cols = ", ".join(df.columns.tolist()) if not df.empty else "ফাইল লোড হয়নি"
+    cols = ", ".join(df.columns.tolist()) if not df.empty else "File not loaded"
     text = (
-        "🤖 *স্টক ইনফো বট-এ স্বাগতম!*\n\n"
-        f"📊 এক্সেল কলাম: `{cols}`\n\n"
-        "🔍 যেকোনো আইটেমের নাম লিখুন, আমি তথ্য দেবো।\n\n"
-        "📌 *কমান্ড:*\n"
-        "/start — শুরু করুন\n"
-        "/list — সব আইটেম দেখুন\n"
-        "/reload — এক্সেল রিলোড করুন (admin)\n"
-        "/upload — নতুন এক্সেল আপলোড করুন (admin)"
+        "🤖 *Welcome to Stock Info Bot!*\n\n"
+        f"📊 Excel columns: `{cols}`\n\n"
+        "🔍 Type any item name to get info.\n\n"
+        "📌 *Commands:*\n"
+        "/start - Start the bot\n"
+        "/list - Show all items\n"
+        "/reload - Reload Excel (admin)\n"
+        "/upload - Upload new Excel (admin)"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -100,13 +87,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = load_data()
     if df.empty:
-        await update.message.reply_text("❌ ডেটা পাওয়া যায়নি।")
+        await update.message.reply_text("No data found.")
         return
 
     name_col = df.columns[0]
     names = df[name_col].dropna().tolist()
 
-    # ইনলাইন বাটন হিসেবে দেখাও
     keyboard = []
     for i in range(0, len(names), 2):
         row = [InlineKeyboardButton(names[i], callback_data=f"item:{names[i]}")]
@@ -116,46 +102,43 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        f"📋 *মোট {len(names)}টি আইটেম পাওয়া গেছে।*\nযেটি দেখতে চান ট্যাপ করুন:",
+        f"📋 *Total {len(names)} items found.*\nTap to view details:",
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
 
 
 async def reload_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin কমান্ড: এক্সেল রিলোড"""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ এই কমান্ড শুধু Admin ব্যবহার করতে পারবেন।")
+        await update.message.reply_text("This command is for admin only.")
         return
     df = load_data()
     if df.empty:
-        await update.message.reply_text("❌ এক্সেল লোড করতে সমস্যা হয়েছে।")
+        await update.message.reply_text("Failed to load Excel.")
     else:
         await update.message.reply_text(
-            f"✅ এক্সেল সফলভাবে রিলোড হয়েছে!\n"
-            f"📊 মোট {len(df)} সারি, {len(df.columns)} কলাম।"
+            f"Excel reloaded successfully!\n"
+            f"Total {len(df)} rows, {len(df.columns)} columns."
         )
 
 
 async def upload_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin কমান্ড: নতুন এক্সেল আপলোড করার নির্দেশনা"""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ এই কমান্ড শুধু Admin ব্যবহার করতে পারবেন।")
+        await update.message.reply_text("This command is for admin only.")
         return
     await update.message.reply_text(
-        "📤 নতুন এক্সেল ফাইল এখানে পাঠান (attach করুন)।\n"
-        "ফাইলটি স্বয়ংক্রিয়ভাবে `data.xlsx` হিসেবে সেভ হবে।"
+        "Please send the new Excel file as attachment.\n"
+        "It will be saved automatically as data.xlsx"
     )
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin এক্সেল ফাইল পাঠালে সেভ করে"""
     if update.effective_user.id not in ADMIN_IDS:
         return
 
     doc = update.message.document
     if not doc.file_name.endswith((".xlsx", ".xls")):
-        await update.message.reply_text("⚠️ শুধু .xlsx বা .xls ফাইল গ্রহণযোগ্য।")
+        await update.message.reply_text("Only .xlsx or .xls files are accepted.")
         return
 
     file = await doc.get_file()
@@ -163,41 +146,39 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     df = load_data()
     if df.empty:
-        await update.message.reply_text("❌ ফাইল সেভ হয়েছে কিন্তু লোড করতে সমস্যা।")
+        await update.message.reply_text("File saved but failed to load.")
     else:
         await update.message.reply_text(
-            f"✅ নতুন এক্সেল সফলভাবে আপলোড হয়েছে!\n"
-            f"📊 মোট {len(df)} সারি | কলাম: {', '.join(df.columns.tolist())}"
+            f"New Excel uploaded successfully!\n"
+            f"Total {len(df)} rows | Columns: {', '.join(df.columns.tolist())}"
         )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ইউজারের টেক্সট মেসেজ হ্যান্ডেল"""
     query = update.message.text.strip()
     df = load_data()
 
     if df.empty:
-        await update.message.reply_text("❌ ডেটা লোড করতে সমস্যা হয়েছে। Admin কে জানান।")
+        await update.message.reply_text("Data load failed. Contact admin.")
         return
 
     items = find_item(df, query)
 
     if not items:
-        # কাছাকাছি সাজেশন দেখাও
         name_col = df.columns[0]
         all_names = df[name_col].tolist()
         suggestions = get_close_matches(query.lower(), [n.lower() for n in all_names], n=3, cutoff=0.3)
         if suggestions:
             keyboard = [[InlineKeyboardButton(s.title(), callback_data=f"item:{s}")] for s in suggestions]
             await update.message.reply_text(
-                f"🔍 *'{query}'* পাওয়া যায়নি। এগুলো কি খুঁজছেন?",
+                f"*'{query}'* not found. Did you mean:",
                 reply_markup=InlineKeyboardMarkup(keyboard),
                 parse_mode="Markdown"
             )
         else:
             await update.message.reply_text(
-                f"❌ *'{query}'* নামে কোনো আইটেম পাওয়া যায়নি।\n"
-                "/list দিয়ে সব আইটেম দেখুন।",
+                f"*'{query}'* not found.\n"
+                "Use /list to see all items.",
                 parse_mode="Markdown"
             )
         return
@@ -207,7 +188,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ইনলাইন বাটন ক্লিক হ্যান্ডেল"""
     query = update.callback_query
     await query.answer()
 
@@ -220,8 +200,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(response, parse_mode="Markdown")
 
 
-# ===================== মেইন =====================
-
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -233,7 +211,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
 
-    logger.info("বট চালু হচ্ছে...")
+    logger.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
