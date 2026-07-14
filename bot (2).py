@@ -1,0 +1,203 @@
+import os
+import logging
+import threading
+import pandas as pd
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    filters, ContextTypes, CallbackQueryHandler
+)
+from difflib import get_close_matches
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_IDS = [int(os.environ.get("ADMIN_ID", "0"))]
+
+SHEET_ID = "1oKSibZspCOVD9qPwlS-pu82K6DWbJ8mTZRa5W-WDkVQ"
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive web server
+# ---------------------------------------------------------------------------
+# Render's free Web Service spins down after 15 minutes with no incoming HTTP
+# requests. This tiny Flask app gives an external pinger (e.g. UptimeRobot or
+# cron-job.org) something to hit every 5-10 minutes so the service stays awake
+# and the Telegram bot's polling loop keeps running.
+keep_alive_app = Flask(__name__)
+
+
+@keep_alive_app.route("/")
+def home():
+    return "Bot is alive!"
+
+
+def run_keep_alive_server():
+    port = int(os.environ.get("PORT", 10000))
+    keep_alive_app.run(host="0.0.0.0", port=port)
+
+
+def start_keep_alive_thread():
+    thread = threading.Thread(target=run_keep_alive_server, daemon=True)
+    thread.start()
+    logger.info("Keep-alive server thread started")
+
+
+# ---------------------------------------------------------------------------
+# Bot logic (unchanged)
+# ---------------------------------------------------------------------------
+def load_data() -> pd.DataFrame:
+    try:
+        df = pd.read_csv(SHEET_URL, dtype=str)
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.fillna("-")
+        logger.info(f"Sheet loaded: {len(df)} rows")
+        return df
+    except Exception as e:
+        logger.error(f"Sheet load error: {e}")
+        return pd.DataFrame()
+
+
+def find_item(df: pd.DataFrame, query: str) -> list[dict]:
+    if df.empty:
+        return []
+
+    name_col = df.columns[0]
+    all_names = df[name_col].tolist()
+
+    exact = df[df[name_col].str.lower() == query.lower()]
+    if not exact.empty:
+        return exact.to_dict("records")
+
+    close = get_close_matches(query.lower(), [n.lower() for n in all_names], n=5, cutoff=0.4)
+    if close:
+        mask = df[name_col].str.lower().isin(close)
+        return df[mask].to_dict("records")
+
+    mask = df[name_col].str.lower().str.contains(query.lower(), na=False)
+    return df[mask].to_dict("records")
+
+
+def format_item_response(items: list[dict]) -> str:
+    if not items:
+        return "No item found."
+
+    lines = []
+    for item in items:
+        cols = list(item.keys())
+        lines.append("-" * 28)
+        for i, col in enumerate(cols):
+            emoji = "📦" if i == 0 else ("💰" if i == 2 else ("🔢" if i == 1 else "📌"))
+            lines.append(f"{emoji} *{col}:* {item[col]}")
+    lines.append("-" * 28)
+    return "\n".join(lines)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df = load_data()
+    cols = ", ".join(df.columns.tolist()) if not df.empty else "Sheet not loaded"
+    text = (
+        "🤖 *Welcome to Stock Info Bot!*\n\n"
+        f"📊 Columns: `{cols}`\n\n"
+        "🔍 Type any item name to get info.\n\n"
+        "📌 *Commands:*\n"
+        "/start - Start the bot\n"
+        "/list - Show all items\n"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    df = load_data()
+    if df.empty:
+        await update.message.reply_text("No data found.")
+        return
+
+    name_col = df.columns[0]
+    names = df[name_col].dropna().tolist()
+
+    keyboard = []
+    for i in range(0, len(names), 2):
+        row = [InlineKeyboardButton(names[i], callback_data=f"item:{names[i]}")]
+        if i + 1 < len(names):
+            row.append(InlineKeyboardButton(names[i + 1], callback_data=f"item:{names[i+1]}"))
+        keyboard.append(row)
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"📋 *Total {len(names)} items found.*\nTap to view details:",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.message.text.strip()
+    df = load_data()
+
+    if df.empty:
+        await update.message.reply_text("Data load failed. Try again later.")
+        return
+
+    items = find_item(df, query)
+
+    if not items:
+        name_col = df.columns[0]
+        all_names = df[name_col].tolist()
+        suggestions = get_close_matches(query.lower(), [n.lower() for n in all_names], n=3, cutoff=0.3)
+        if suggestions:
+            keyboard = [[InlineKeyboardButton(s.title(), callback_data=f"item:{s}")] for s in suggestions]
+            await update.message.reply_text(
+                f"*'{query}'* not found. Did you mean:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"*'{query}'* not found.\nUse /list to see all items.",
+                parse_mode="Markdown"
+            )
+        return
+
+    response = format_item_response(items)
+    await update.message.reply_text(response, parse_mode="Markdown")
+
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data.startswith("item:"):
+        item_name = data[5:]
+        df = load_data()
+        items = find_item(df, item_name)
+        response = format_item_response(items)
+        await query.message.reply_text(response, parse_mode="Markdown")
+
+
+def main():
+    # Start the keep-alive HTTP server in the background first, so Render
+    # detects an open port immediately and the free service has something
+    # for an external pinger (UptimeRobot / cron-job.org) to hit.
+    start_keep_alive_thread()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("list", list_items))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
+
+    logger.info("Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
